@@ -1,159 +1,350 @@
+print("running")
+
+# Print the path of the Python interpreter being used
+import sys
+print("Python executable being used:", sys.executable)
+
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.signal import spectrogram
-from sklearn import metrics
-from sklearn import linear_model
 from open_ephys.analysis import Session
-from sklearn.metrics import r2_score
-from sklearn.linear_model import LinearRegression
+import os
+import matplotlib.ticker as ticker
+from scipy.io import loadmat
+import syncopy as spy
+from syncopy.datatype.continuous_data import AnalogData
+import json
+cfg = spy.StructDict()
+import psutil
+import time
 
-# Load Open Ephys data
-directory = '/Users/rowhandaly/Desktop/2024-01-31_23-11-10'
-session = Session(directory)
-recording = session.recordnodes[0].recordings[0]
+# Function to print CPU and memory usage
+def print_resource_usage():
+    print(f"CPU usage: {psutil.cpu_percent(interval=1)}%")
+    memory_info = psutil.virtual_memory()
+    print(f"Memory usage: {memory_info.percent}%")
+    # print(f"Available memory: {memory_info.available / (1024 ** 2)} MB")
+    # print(f"Used memory: {memory_info.used / (1024 ** 2)} MB")
 
-# Set the number of signals
-x = 16
+print("packages loaded")
 
+"""
+LOAD PARAMETERS AND DATA FROM JSON CONFIG FILE:
+general parameters: num_signals, trials (1 sec @ 30000 hz), dead channels, trial/channel number of single psd
+matlab parameters: raw data array
+open ephys binary parameters: load TTL text file, load timestamps file, enter sync, load directory
+"""
+
+# load json config file
+with open('/home/rdaly12/Desktop/configH91421.json') as f:
+    config = json.load(f)
+
+# general parameters
+data_source = config['data_source']
+num_signals = config['num_signals']
+trials = config['trials']
+dead_channels = config['dead_channels']
+tnum = config['tnum']
+cnum = config['cnum']
+alphabeta_lower = config['alphabeta_lower']
+alphabeta_upper = config['alphabeta_upper']
+gamma_lower = config['gamma_lower']
+gamma_upper = config['gamma_upper']
+
+if data_source == 'matlab':
+    # matlab parameters
+    file = config['file']
+elif data_source == 'open_ephys_binary':
+    # open ephys parameters
+    ttl = config['ttl']
+    timestamps = config['timestamps']
+    sync = config['sync']
+    directory = config['directory']
+
+print("parameters loaded")
+
+
+"""
+DATA FORMATTING:
+format of signals_list: signals_list[i] is the ith trial, contains 30000 sublists, each with num_signals signals
+"""
+# matlab
+def matlab(file):
+    signals_list = []
+    mat_data = loadmat(file)
+    values_list = list(mat_data.values())
+    signals = values_list[3]
+    for i in range(trials):
+        signals_list.append([])
+        signals_list[i].append(signals[30000*i:30000*(i+1)])
+    return signals_list
+
+# open ephys binary
+def open_ephys_binary(ttl, timestamps, sync, directory):
+    print_resource_usage()
+    # load messages
+    # array is file containing TTL messages
+    array = np.load(ttl)
+    str_array = [item.decode() for item in array]
+    split_array = [item.split() for item in str_array]
+    messages = split_array
+    
+    # load timestamps
+    # timestamps is file containing sample numbers, same length as array
+    timestamps = np.load (timestamps)
+    
+    # enter sync
+    sync = sync
+
+    # set print settings
+    np.set_printoptions(threshold=np.inf)
+
+    # find beginning of trials
+    w = 0
+    for i in range(len(messages)):
+        if 'IsAcquiring' in messages[i]:
+            w = i
+   
+    # combine messages and timestamps
+    mandt = []
+    for i in range(w, len(messages)):
+        if len(messages)-1 != i:
+            mandt.append([])
+            mandt[i-w].append(i)
+            mandt[i-w].append(messages[i])
+            mandt[i-w].append(timestamps[i])
+            mandt[i-w].append(int(timestamps[i+1])-int(timestamps[i]))
+   
+    # find good trials
+    ms = []
+    for i in range(len(mandt)):
+        if 'GoodOrBadTrial' in mandt[i][1][0] and '1' in mandt[i][1][1]:
+            ms.append(mandt[(i-2)])
+
+    # get samples
+    samples = []
+    for i in range(len(ms)):
+        samples.append(int(ms[i][2]-(15000+sync)))
+
+
+    # load open ephys session
+    directory = directory
+    session = Session(directory)
+    recording = session.recordnodes[0].recordings[0]
+    
+    print("session loaded")
+    
+    return recording, samples
+    
+#     # get the first x signals from the recording
+#     slist = []
+#     signals_list = []
+#     for g in range(trials):
+#         # REVERSE SIGNALS!
+#         print("getting signal trial", g)
+#         slist.append([])
+#         for i in range(num_signals):
+#             slist[g].append([subarray[-i] for subarray in recording.continuous[0].get_samples(start_sample_index = samples[g], end_sample_index = samples[g]+30000)])
+   
+#     print("loop ended")
+    
+#     for g in range(trials):
+#         print("adding signal trial", g)
+#         signals_list.append([])
+#         for w in range(30000): 
+#             signals_list[g].append([])
+#             for i in range(num_signals):
+#                 signals_list[g][w].append(slist[g][i][w])
+   
+#     return signals_list
+
+print("functions defined")
+
+if data_source == 'matlab':
+    print("matlab data source")
+    signals_list = matlab(file)
+elif data_source == 'open_ephys_binary':
+    print("binary data source")
+    recording, samples = open_ephys_binary(ttl, timestamps, sync, directory)
+
+# # delete dead channels
+# for t in dead_channels:
+#     for i in range(trials):
+#         for w in range(30000):
+#             del signals_list[i][w][t]
+# # might require debugging if # of dead channels > 1
+# del_chs = len(dead_channels) # number of deleted channels 250
+# num_signals = num_signals - del_chs
+
+
+"""
+COMPUTATION AND GRAPHING:
+1. produces PSD for specified trials/channels
+2. produces PSD averaged across all trials for each channel
+3. produces RPM for all trials/channels
+4. produces RPF for all trials/channels
+"""
+# get the first x signals from the recording
+slist = []
 signals_list = []
-for i in range(x):
-    signals_list.append([subarray[i] for subarray in recording.continuous[0].get_samples(start_sample_index=0, end_sample_index=10000)])
+   
 
-# Set the parameters for the spectrogram
-window_size = 8192  # Set window_size to the length of the shortest signal
-n_overlap = window_size // 2  # Ensure n_overlap is less than window_size
+# initialize list to store all psds
+plot_data1 = []
 
-# Initialize an empty list to store the power spectral densities
-psds = []
+for w in range(trials):
+    print (f"trial {w+1}")
+    print_resource_usage()
+    
+    # REVERSE SIGNALS!
+    slist.append([])
+    for i in range(num_signals):
+        slist[w].append([subarray[-i] for subarray in recording.continuous[0].get_samples(start_sample_index = samples[w], end_sample_index = samples[w]+30000)])
 
-# Initialize frequencies to None
-frequencies = None
+    signals_list.append([])
+    for g in range(30000): 
+        signals_list[w].append([])
+        for i in range(num_signals):
+            signals_list[w][g].append(slist[w][i][g])
+    
+    # load trial and format as 2d numpy array
+    trial_signals_list = signals_list[0]
 
-# Assuming signals_list is a list of numpy arrays, where each numpy array is a signal
-for i in range(x):
-    # Get the signal from signals_list and convert it to a numpy array
-    signal = np.array(signals_list[i])
 
-    # Compute the spectrogram
-    freq, time, Sxx = spectrogram(signal, fs=500, window='hann', nperseg=window_size, noverlap=n_overlap)
+    signals = np.array(trial_signals_list)
+    signals = np.squeeze(signals)
 
-    # If frequencies is None, set it to freq
-    if frequencies is None:
-        frequencies = freq
+    # initialize list to store psds per trial
+    psds = []
 
-    # Calculate the power spectral density
-    psd = np.mean(Sxx**2, axis=1)
+    # define frequency range
+    freq = np.linspace(0, 150, 150)  # frequencies from 0 to 150 Hz with a step of 1 Hz
+    freq = freq.flatten()
 
-    # Append the PSD to the list
-    psds.append(psd)
+    # pass data to analogdata constructor
+    analog_data = AnalogData(data=signals, samplerate=30000)
 
-# Convert the list of PSDs to a 2D arrayc
-psds = np.array(psds)
+    # pass analog data to freqanalysis method
+    fft_spectra = spy.freqanalysis(analog_data, output='pow', method='mtmfft', foi=np.arange(0, 150), tapsmofrq=2, pad = 'nextpow2')
+    psd = fft_spectra.data
 
-# Normalize the PSDs to a range of 0 to 1 for each frequency
-psds = psds / np.max(psds, axis=0)
+    # append psd values to psds
+    for i in range(num_signals):
+        psd_single = psd[0, 0, :, i].flatten()
+        psds.append(psd_single)  # Append the PSD values to psds
 
-# Create a figure and axis
+    plt.figure()
+    
+    # plot single trials
+    if w == tnum:
+        for i in range(len(tnum)):
+            ts1 = psd[0,0,:,cnum]
+            plt.plot(freq, ts1)
+        plt.xlabel('Frequency (Hz)')
+        plt.ylabel('Power')
+        plt.title('Power Spectral Density')
+        plt.savefig(f'/home/rdaly12/Desktop/Channel{cnum[0]+1}Trial{tnum[0]+1}.png')
+        # plt.savefig(f'/Users/rowhandaly/desktop/Channel{cnum[0]+1}Trial{tnum[0]+1}.png')
+        plt.close()
+
+    # convert list of psds to 2d array
+    psds = np.array(psds)
+    plot_data1.append(psds)
+    
+    
+"""
+COMBINE TRIALS
+"""
+
+# calculate averages across trials
+average_data1 = np.mean(plot_data1, axis=0)
+
+
+for i in range(num_signals):
+    plt.figure()
+    plt.plot(freq, average_data1[i])
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power')
+    plt.title('Power Spectral Density')
+    plt.savefig(f'/home/rdaly12/Desktop/AVGpsdChannel{i+1}.png')
+    # plt.savefig(f'/Users/rowhandaly/desktop/AvgPSDs/Channel{i+1}.png')
+    plt.close()
+
+plt.figure()
+
+average_data1 = average_data1 / np.max(average_data1, axis=0)
+
 fig, ax = plt.subplots()
-
-# Create a heatmap of the normalized PSDs
-cax = ax.imshow(psds, aspect='auto', cmap='viridis', origin='lower')
-
-# Add a colorbar to the figure
+cax = ax.imshow(average_data1, aspect='auto', cmap='viridis', origin='lower')
 fig.colorbar(cax, label='Normalized PSD')
 
-# Set the x-ticks and x-tick labels to be the frequencies
-ax.set_xticks(np.arange(0, len(frequencies), 10))
-ax.set_xticklabels(frequencies[::10])
+# set the x-ticks and x-tick labels to be the frequencies and format them
+ax.set_xticks(np.arange(0, len(freq), 50))
+ax.set_xticklabels(freq[::50])
+ax.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.0f'))
 
-# Set the labels for the x-axis and y-axis
+# set the y-ticks and y-tick labels to be the signal numbers and format them
+ax.set_yticks([num_signals, 0])
+ax.set_yticklabels([num_signals, 1])
+ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.0f'))
+
+# set the labels for the x-axis and y-axis
 ax.set_xlabel('Frequency (Hz)')
 ax.set_ylabel('Signal number')
 
-# Set the x-ticks and x-tick labels to be every 20th frequency
-ax.set_xticks(np.arange(0, len(frequencies), 1000))
-ax.set_xticklabels(frequencies[::1000])
-
-# Set the title of the plot
+# set the title of the plot
 ax.set_title('Normalized PSDs')
 
-# Display the plot
-plt.savefig('/Users/rowhandaly/desktop/RPM.png')
+# display the plot
+plt.savefig('/home/rdaly12/Desktop/RPM-average.png')
 
-# Set the frequency band limits
-bands = [(10, 19), (75, 150)]
+# plt.savefig('/Users/rowhandaly/desktop/RPM-average.png')
 
-def calculate_band_power(a, b, freq, psds):
-    # Find the indices of the frequency array where the frequency is between a and b
-    freq_indices = np.where((freq >= a) & (freq <= b))[0]  # Take the first element of the tuple
-
-    # Calculate the power for each signal in the specified frequency band
-    band_power = psds[:, freq_indices]
-
-    return band_power
-
-# Create a new figure
+# create a new figure
 plt.figure()
 
-# Calculate and plot the power for each signal in each frequency band
-for a, b in bands:
-    band_power = calculate_band_power(a, b, frequencies, psds)
-    avg_band_power = np.mean(band_power, axis=1)  # Calculate the average power for each signal in the band
-    plt.plot(avg_band_power, range(1, len(avg_band_power) + 1), label='{}-{} Hz'.format(a, b))  # Plot the average power
+# relative power function
+rpfab = []
+rpfg = []
+for i in range(num_signals):
+    # Calculate the average power in the alpha/beta and gamma bands
+    alphabeta_power = np.mean(average_data1[i, (freq >= alphabeta_lower) & (freq <= alphabeta_upper)])
+    rpfab.append(alphabeta_power)
+    gamma_power = np.mean(average_data1[i, (freq >= gamma_lower) & (freq <= gamma_upper)])
+    rpfg.append(gamma_power)
 
-plt.xlabel('Power')
+# make num_signals an array
+signal_numbers = np.arange(num_signals)
+
+plt.figure()
+plt.plot(rpfab, signal_numbers, label = 'Alpha-Beta Band')
+plt.plot(rpfg, signal_numbers, label = 'Gamma Band')
+plt.xlabel('Relative Power')
 plt.ylabel('Signal number')
-plt.xlim(0,1)
+plt.title('Relative Power in Alpha/Beta and Gamma Bands')
+plt.savefig('/home/rdaly12/Desktop/RPF-average.png')
+# plt.savefig('/Users/rowhandaly/desktop/RPF-average.png')
+
+
+# create a new figure
+plt.figure()
+
+# Filter out points below 0.1 relative power
+filtered_rpfab = [power for power in rpfab if power >= 0.1]
+filtered_rpfg = [power for power in rpfg if power >= 0.1]
+filtered_signal_numbers_ab = [i for i, power in enumerate(rpfab) if power >= 0.1]
+filtered_signal_numbers_g = [i for i, power in enumerate(rpfg) if power >= 0.1]
+
+plt.figure()
+plt.plot(filtered_rpfab, filtered_signal_numbers_ab, label='Alpha-Beta Band')
+plt.plot(filtered_rpfg, filtered_signal_numbers_g, label='Gamma Band')
+plt.xlabel('Relative Power')
+plt.ylabel('Signal number')
+plt.title('Relative Power in Alpha/Beta and Gamma Bands')
 plt.legend()
-plt.savefig('/Users/rowhandaly/desktop/RPF')
+plt.savefig('/home/rdaly12/Desktop/filtered-RPF-average.png')
+# plt.savefig('/Users/rowhandaly/desktop/filtered - RPF-average.png')
 
-# Set the minimum range size
-min_range_size = 7
 
-# Initialize the best G and the best range
-best_G = -np.inf
-best_range = None
-
-# Calculate the power for each signal in each frequency band and calculate the goodness of fit for each possible range of signals
-for a, b in bands:
-    band_power = calculate_band_power(a, b, freq, psds)
-    if band_power.size > 0 and not np.isnan(band_power).any():
-        avg_band_power = np.mean(band_power, axis=1)
-    else:
-        continue
-    # Calculate the goodness of fit for each possible range of signals greater than or equal to 7
-    for i in range(len(avg_band_power) - min_range_size + 1):
-        for j in range(i + min_range_size, len(avg_band_power) + 1):
-            # Calculate the linear regression for the range
-            model_ab = LinearRegression().fit(np.array(range(i, j)).reshape(-1, 1), avg_band_power[i:j])
-            R2_ab = model_ab.score(np.array(range(i, j)).reshape(-1, 1), avg_band_power[i:j])
-            s_ab = np.sign(model_ab.coef_[0])
- 
-            # Initialize R2_g
-            R2_g = 0
-
-            # Calculate the linear regression for the rest of the signals
-            if i < j and j < len(avg_band_power):
-                model_g = LinearRegression().fit(np.array(list(range(i)) + list(range(j, len(avg_band_power)))).reshape(-1, 1), 
-                                                 np.concatenate((avg_band_power[:i], avg_band_power[j:])))
-                if len(np.array(list(range(i)) + list(range(j, len(avg_band_power)))).reshape(-1, 1)) >= 2:
-                    R2_g = model_g.score(np.array(list(range(i)) + list(range(j, len(avg_band_power)))).reshape(-1, 1), 
-                                         np.concatenate((avg_band_power[:i], avg_band_power[j:])))
-                else:
-                    pass
-                   # print("Not enough samples for R^2 score")
-                s_g = np.sign(model_g.coef_[0])
-            else:
-                pass
-               # print("Invalid range for linear regression")
-
-            # Calculate the goodness of fit
-            f = 0.04 * (j - i) + 0.72
-            G = s_ab * R2_ab * -s_g**2 * R2_g * f
-
-            if G > best_G:
-                best_G = G
-                best_range = (i, j)
-
-print('Best range:', best_range)
-print('Best G:', best_G)
+# end of code
+print("code complete")
+# os.system('afplay /System/Library/Sounds/Ping.aiff'
